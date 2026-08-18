@@ -95,6 +95,15 @@ RUST_ASHMEM_METHOD_PATTERNS = {
 # 6.12 在 open 之前移除/移动了字段，因此与 6.6 GKI 相比，open/release/show_fdinfo
 # 下移了 8 字节。这里仅列出我们验证/匹配的字段。
 FOPS_LAYOUTS = {
+    '6.1': {
+        # 6.1 仍有 iterate/iterate_shared，且 GKI 在 fallocate 之后
+        # 插入了 fop_flags（4 字节，对齐后占用 8 字节），
+        # 因此 show_fdinfo 从 0xd8 下移到 0xe0。
+        'owner': 0x00, 'llseek': 0x08, 'read': 0x10, 'write': 0x18,
+        'read_iter': 0x20, 'write_iter': 0x28,
+        'ioctl': 0x50, 'compat_ioctl': 0x58, 'mmap': 0x60,
+        'open': 0x70, 'release': 0x80, 'show_fdinfo': 0xe0,
+    },
     '6.6': {
         'owner': 0x00, 'llseek': 0x08, 'read': 0x10, 'write': 0x18,
         'read_iter': 0x20, 'write_iter': 0x28,
@@ -112,6 +121,21 @@ FOPS_LAYOUTS = {
 # 用于生成 target.h 的标准 fops 字段偏移量，按布局版本分组。
 # 这些是写入 target.h 末尾的 FOPS_*_OFF 宏定义。
 FOPS_FIELD_DEFINES = {
+    '6.1': [
+        ("FOPS_OWNER_OFF", "0x00"),
+        ("FOPS_LLSEEK_OFF", "0x08"),
+        ("FOPS_READ_OFF", "0x10"),
+        ("FOPS_WRITE_OFF", "0x18"),
+        ("FOPS_READ_ITER_OFF", "0x20"),
+        ("FOPS_WRITE_ITER_OFF", "0x28"),
+        ("FOPS_IOCTL_OFF", "0x50"),
+        ("FOPS_COMPAT_IOCTL_OFF", "0x58"),
+        ("FOPS_MMAP_OFF", "0x60"),
+        ("FOPS_OPEN_OFF", "0x70"),
+        ("FOPS_RELEASE_OFF", "0x80"),
+        ("FOPS_SPLICE_READ_OFF", "0xc0"),
+        ("FOPS_SHOW_FDINFO_OFF", "0xe0"),
+    ],
     '6.6': [
         ("FOPS_OWNER_OFF", "0x00"),
         ("FOPS_LLSEEK_OFF", "0x08"),
@@ -763,21 +787,51 @@ class KernelImage:
         return results
 
     def find_ashmem_misc_fops(self):
-        """通过读取 ashmem_misc.fops 指针查找 ASHMEM_MISC_FOPS 偏移量。"""
-        misc_addr = self.sym_addr('ashmem_misc')
+        """通过读取 ashmem_misc.fops 指针查找 ASHMEM_MISC_FOPS 偏移量。
+
+        struct miscdevice 布局（arm64）：
+            int minor            @ 0x00
+            const char *name     @ 0x08
+            const struct file_operations *fops  @ 0x10
+        ashmem_misc.minor 为 MISC_DYNAMIC_MINOR（255），name 为 "ashmem"。
+        某些内核（如 6.1）的 kallsyms 中可能没有 ashmem_misc 符号，
+        此时通过扫描指向 ashmem_fops 的指针并验证 name 字段来定位。
+        """
         fops_addr = self.sym_addr('ashmem_fops')
-        if misc_addr is None or fops_addr is None:
-            return None, "ashmem_misc 或 ashmem_fops 未找到"
+        if fops_addr is None:
+            return None, "ashmem_fops 未找到"
 
-        misc_off = self.addr_to_off(misc_addr)
+        misc_addr = self.sym_addr('ashmem_misc')
+        if misc_addr is not None:
+            misc_off = self.addr_to_off(misc_addr)
+            # 在 ashmem_misc 结构体中搜索 fops 指针（前 0x48 字节）
+            for i in range(0, 0x48, 8):
+                val = self.u64(misc_off + i)
+                if val == fops_addr:
+                    return misc_off + i, f"在 ashmem_misc+{i:#x} 处找到"
 
-        # 在 ashmem_misc 结构体中搜索 fops 指针（前 0x48 字节）
-        for i in range(0, 0x48, 8):
-            val = self.u64(misc_off + i)
-            if val == fops_addr:
-                return misc_off + i, f"在 ashmem_misc+{i:#x} 处找到"
+        # 回退：ashmem_misc 符号缺失，扫描指向 ashmem_fops 的指针，
+        # 验证 miscdevice 的 name 字段为 "ashmem" 且 minor 为 255。
+        fops_packed = struct.pack('<Q', fops_addr)
+        pos = 0
+        while True:
+            idx = self.img.find(fops_packed, pos)
+            if idx < 0:
+                break
+            pos = idx + 8
 
-        return None, "在 ashmem_misc 中未找到 fops 指针"
+            misc_base = idx - 0x10  # fops 字段位于 miscdevice+0x10
+            if misc_base < 0:
+                continue
+            name_ptr = self.u64(misc_base + 0x08)
+            minor = self.u32(misc_base)
+            if name_ptr is None or minor != 255:
+                continue
+            name = self.read_string_at_addr(name_ptr)
+            if name == 'ashmem':
+                return idx, "扫描 ashmem_fops 指针定位（name=\"ashmem\", minor=255）"
+
+        return None, "ashmem_misc 符号缺失且扫描未定位到 miscdevice"
 
     def find_slide_offsets(self):
         """通过解析 random_table 查找 boot_id 条目来获取 SLIDE 偏移量。"""
